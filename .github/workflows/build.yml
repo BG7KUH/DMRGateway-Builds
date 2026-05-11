@@ -183,8 +183,35 @@ jobs:
         with:
           path: release-artifacts
 
+      - name: Stage release assets (unique names)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-dist
+
+          # Linux builds produce a binary named 'DMRGateway'
+          for dir in release-artifacts/dmrgateway-linux-*; do
+            [ -d "$dir" ] || continue
+            base="$(basename "$dir" | sed 's/^dmrgateway-//')"
+            if [ -f "$dir/DMRGateway" ]; then
+              cp "$dir/DMRGateway" "release-dist/DMRGateway-${base}"
+            fi
+          done
+
+          # Windows builds produce a binary named 'DMRGateway.exe'
+          for dir in release-artifacts/dmrgateway-windows-*; do
+            [ -d "$dir" ] || continue
+            base="$(basename "$dir" | sed 's/^dmrgateway-//')"
+            if [ -f "$dir/DMRGateway.exe" ]; then
+              cp "$dir/DMRGateway.exe" "release-dist/DMRGateway-${base}.exe"
+            fi
+          done
+
+          ls -la release-dist
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            release-artifacts/**
+            release-dist/*
+          fail_on_unmatched_files: true
