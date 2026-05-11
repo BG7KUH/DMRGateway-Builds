@@ -1,0 +1,179 @@
+name: build-dmrgateway
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: linux-${{ matrix.arch }}-${{ matrix.compiler }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            compiler: gcc
+          - arch: x86_64
+            compiler: clang
+          - arch: arm64
+            compiler: gcc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential make git pkg-config \
+            libmosquitto-dev libssl-dev nlohmann-json3-dev libserialport-dev
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            sudo apt-get install -y clang
+          fi
+
+      - name: Build (x86_64)
+        if: matrix.arch == 'x86_64'
+        run: |
+          git clone https://github.com/g4klx/DMRGateway.git
+          cd DMRGateway
+          mkdir -p ../artifacts/${{ matrix.arch }}-${{ matrix.compiler }}
+          set -o pipefail
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            make clean
+            make -j2 CC=clang CXX=clang++ 2>&1 | tee ../artifacts/${{ matrix.arch }}-${{ matrix.compiler }}/build.log
+          else
+            make clean
+            make -j2 2>&1 | tee ../artifacts/${{ matrix.arch }}-${{ matrix.compiler }}/build.log
+          fi
+          cp DMRGateway ../artifacts/${{ matrix.arch }}-${{ matrix.compiler }}/
+
+      - name: Build (arm64 via container)
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build (arm64 via container - run)
+        if: matrix.arch == 'arm64'
+        run: |
+          mkdir -p artifacts/arm64-gcc
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/work" \
+            ubuntu:22.04 bash -lc "\
+              apt-get update && \
+              apt-get install -y build-essential make git pkg-config \
+                libmosquitto-dev libssl-dev nlohmann-json3-dev libserialport-dev && \
+              git clone https://github.com/g4klx/DMRGateway.git /tmp/DMRGateway && \
+              cd /tmp/DMRGateway && \
+              make clean && (make -j2 2>&1 | tee /work/artifacts/arm64-gcc/build.log) && \
+              cp DMRGateway /work/artifacts/arm64-gcc/\
+            "
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmrgateway-linux-${{ matrix.arch }}-${{ matrix.compiler }}
+          path: artifacts/${{ matrix.arch }}-${{ matrix.compiler }}/
+
+  build-windows:
+    name: windows-${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            platform: Win32
+          - arch: x64
+            platform: x64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Clone upstream
+        run: git clone https://github.com/g4klx/DMRGateway.git
+
+      - name: Install dependencies
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          if (-not (Test-Path $vcpkgRoot)) { throw "vcpkg not found at $vcpkgRoot" }
+          $triplet = if ("${{ matrix.platform }}" -eq "Win32") { "x86-windows-static" } else { "x64-windows-static" }
+          & "$vcpkgRoot\vcpkg.exe" install mosquitto nlohmann-json --triplet $triplet
+
+      - name: Build
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts\${{ matrix.arch }} | Out-Null
+          cd DMRGateway
+          $ErrorActionPreference = "Stop"
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
+          $triplet = if ("${{ matrix.platform }}" -eq "Win32") { "x86-windows-static" } else { "x64-windows-static" }
+          $env:VCPKG_INCLUDE = "$vcpkgRoot\installed\$triplet\include"
+          $env:VCPKG_LIB = "$vcpkgRoot\installed\$triplet\lib"
+
+          $mosquittoStatic = Join-Path $env:VCPKG_LIB "mosquitto_static.lib"
+          $mosquittoLib = Join-Path $env:VCPKG_LIB "mosquitto.lib"
+          if ((Test-Path $mosquittoStatic) -and (-not (Test-Path $mosquittoLib))) {
+            Copy-Item -Path $mosquittoStatic -Destination $mosquittoLib
+          }
+
+          $propsLines = @(
+            '<Project>',
+            '  <ItemDefinitionGroup>',
+            '    <ClCompile>',
+            '      <PreprocessorDefinitions>LIBMOSQUITTO_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>',
+            '      <AdditionalIncludeDirectories>$(VCPKG_INCLUDE);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>',
+            '      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>',
+            '    </ClCompile>',
+            '    <Link>',
+            '      <AdditionalLibraryDirectories>$(VCPKG_LIB);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>',
+            '      <AdditionalDependencies>pthreadVC3.lib;libssl.lib;libcrypto.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>',
+            '    </Link>',
+            '  </ItemDefinitionGroup>',
+            '</Project>'
+          )
+          $propsLines | Set-Content Directory.Build.props
+
+          $gitVersion = (git rev-parse HEAD)
+          Set-Content GitVersion.h -Value ('const char *gitversion = "' + $gitVersion + '";')
+
+          msbuild DMRGateway.vcxproj /m /p:Configuration=Release /p:Platform=${{ matrix.platform }} 2>&1 | Tee-Object -FilePath ..\artifacts\${{ matrix.arch }}\build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Collect artifacts
+        run: |
+          Get-ChildItem -Path DMRGateway -Filter DMRGateway.exe -Recurse |
+            Select-Object -First 1 |
+            Copy-Item -Destination artifacts\${{ matrix.arch }}\ -Force
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dmrgateway-windows-${{ matrix.arch }}
+          path: artifacts/${{ matrix.arch }}
+
+  publish-release:
+    name: publish-release
+    runs-on: ubuntu-22.04
+    needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-artifacts/**
