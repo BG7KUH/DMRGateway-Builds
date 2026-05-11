@@ -107,7 +107,7 @@ jobs:
           if (-not $vcpkgRoot) { $vcpkgRoot = "C:\vcpkg" }
           if (-not (Test-Path $vcpkgRoot)) { throw "vcpkg not found at $vcpkgRoot" }
           $triplet = if ("${{ matrix.platform }}" -eq "Win32") { "x86-windows-static" } else { "x64-windows-static" }
-          & "$vcpkgRoot\vcpkg.exe" install mosquitto nlohmann-json --triplet $triplet
+          & "$vcpkgRoot\vcpkg.exe" install mosquitto nlohmann-json openssl pthreads --triplet $triplet
 
       - name: Build
         run: |
@@ -120,14 +120,24 @@ jobs:
           $env:VCPKG_INCLUDE = "$vcpkgRoot\installed\$triplet\include"
           $env:VCPKG_LIB = "$vcpkgRoot\installed\$triplet\lib"
 
+          if (-not (Test-Path (Join-Path $env:VCPKG_INCLUDE "mosquitto.h"))) {
+            throw "mosquitto.h not found under $env:VCPKG_INCLUDE (vcpkg triplet: $triplet)"
+          }
+          if (-not (Test-Path (Join-Path $env:VCPKG_INCLUDE "nlohmann\json.hpp"))) {
+            throw "nlohmann/json.hpp not found under $env:VCPKG_INCLUDE (vcpkg triplet: $triplet)"
+          }
+
           $mosquittoStatic = Join-Path $env:VCPKG_LIB "mosquitto_static.lib"
           $mosquittoLib = Join-Path $env:VCPKG_LIB "mosquitto.lib"
           if ((Test-Path $mosquittoStatic) -and (-not (Test-Path $mosquittoLib))) {
             Copy-Item -Path $mosquittoStatic -Destination $mosquittoLib
           }
 
-          $propsLines = @(
-            '<Project>',
+          # For classic .vcxproj projects, Directory.Build.props is imported too early (before
+          # the project's own ItemDefinitionGroup overrides), so we use Directory.Build.targets.
+          $targetsLines = @(
+            '<?xml version="1.0" encoding="utf-8"?>',
+            '<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">',
             '  <ItemDefinitionGroup>',
             '    <ClCompile>',
             '      <PreprocessorDefinitions>LIBMOSQUITTO_STATIC;%(PreprocessorDefinitions)</PreprocessorDefinitions>',
@@ -141,7 +151,8 @@ jobs:
             '  </ItemDefinitionGroup>',
             '</Project>'
           )
-          $propsLines | Set-Content Directory.Build.props
+          $targetsLines | Set-Content Directory.Build.targets
+          Remove-Item -Force Directory.Build.props -ErrorAction SilentlyContinue
 
           $gitVersion = (git rev-parse HEAD)
           Set-Content GitVersion.h -Value ('const char *gitversion = "' + $gitVersion + '";')
